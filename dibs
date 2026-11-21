@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""dibs: turn-based heavy compute on this machine.
+
+  dibs run [--est 10m] [--cpus 4] [--mem 4G] [--long] [--label L] -- CMD...
+  dibs ls                       queue and running jobs
+  dibs daemon                   the scheduler (systemd user unit dibsd.service)
+
+`dibs run` files a ticket with the daemon, waits for a license, then runs CMD
+itself inside a systemd scope capped to what it asked for. Output and exit code
+are CMD's own, so whatever launched `dibs run` gets the result directly. Status
+lines go to stderr prefixed with [dibs].
+
+Policy: short jobs (est <= short_max) go before long ones. A job that overruns
+its estimate is treated as long. When a short job is waiting for CPU, the newest
+running long job is frozen (cgroup freezer, RAM kept) and thawed once the short
+work is through. A long job that has waited age_promote counts as short.
+Settings: ~/.config/dibs/config.toml (see config.example.toml).
+"""
+import argparse, asyncio, json, os, re, signal, subprocess, sys, time, tomllib
+
+SOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "dibs.sock")
+LOG = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "dibsq", "jobs.jsonl")
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "dibs", "config.toml")
+CPU_CAP = max(1, os.cpu_count() - 2)  # 2 threads kept for the desktop and untracked work
+MEM_RESERVE = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 10  # 10% of RAM: scales with the machine
+SHORT_MAX = 15 * 60
+AGE_PROMOTE = 30 * 60        # long job waiting this long is scheduled as short
+FREEZE_AFTER = 20            # seconds a short job waits for CPU before a long job is frozen
+FREEZE_BUDGET = 60 * 60      # a job is never frozen for more than this in total
+TICK = 2
+
+
+def parse_dur(s):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smh]?)", s)
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad duration {s!r} (e.g. 90s, 10m, 2h)")
+    return float(m[1]) * {"": 60, "s": 1, "m": 60, "h": 3600}[m[2]]
+
+
+def parse_mem(s):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([KMGT]?)i?B?", s, re.I)
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad size {s!r} (e.g. 512M, 8G)")
+    return int(float(m[1]) * 1024 ** "KMGT".find(m[2].upper()) * 1024) if m[2] else int(m[1])
+
+
+def human(sec):
+    sec = int(sec)
+    return f"{sec // 3600}h{sec % 3600 // 60:02d}m" if sec >= 3600 else f"{sec // 60}m{sec % 60:02d}s"
+
+
+def mem_available():
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    return 0
+
+
+def positive_int(v):
+    if type(v) is not int or v < 1:
+        raise ValueError
+    return v
+
+
+def load_config():
+    try:
+        with open(CONFIG, "rb") as f:
+            cfg = tomllib.load(f)
+    except FileNotFoundError:
+        return
+    except tomllib.TOMLDecodeError as e:
+        sys.exit(f"dibs: {CONFIG}: {e}")
+    parsers = {"cpu_cap": positive_int, "mem_reserve": parse_mem, "short_max": parse_dur,
+               "age_promote": parse_dur, "freeze_after": parse_dur, "freeze_budget": parse_dur}
+    for key, v in cfg.items():
+        if key not in parsers:
+            sys.exit(f"dibs: {CONFIG}: unknown key {key!r}")
+        try:
+            globals()[key.upper()] = parsers[key](v)
+        except (ValueError, TypeError, argparse.ArgumentTypeError):
+            sys.exit(f"dibs: {CONFIG}: bad value for {key}: {v!r} (see config.example.toml)")
+
+
+def user_systemctl(*args):
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True).returncode == 0
+
+
+# ---- daemon ------------------------------------------------------------------
+
+class Job:
+    def __init__(self, jid, req, writer):
+        self.id, self.writer = jid, writer
+        self.cpus, self.mem, self.est = req["cpus"], req["mem"], req["est"]
+        self.long = req["long"] or self.est > SHORT_MAX
+        self.label, self.cmd, self.cwd = req["label"], req["cmd"], req["cwd"]
+        self.submitted, self.started = time.time(), None
+        self.unit, self.state = f"dibs-{jid}", "queued"
+        self.frozen_since, self.frozen_total = None, 0.0
+
+    def short_now(self):
+        if self.state == "queued":
+            return not self.long or time.time() - self.submitted > AGE_PROMOTE
+        return not self.long
+
+    def view(self):
+        now = time.time()
+        return {"id": self.id, "state": self.state, "lane": "short" if self.short_now() else "long",
+                "cpus": self.cpus, "mem": self.mem, "est": self.est, "label": self.label,
+                "cmd": self.cmd, "cwd": self.cwd,
+                "waited": (self.started or now) - self.submitted,
+                "ran": now - self.started if self.started else 0, "frozen_total": self.frozen_total}
+
+
+class Sched:
+    def __init__(self):
+        self.jobs, self.next_id = {}, 1
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+
+    def log(self, job, event, **kw):
+        with open(LOG, "a") as f:
+            f.write(json.dumps({"t": time.time(), "event": event, **job.view(), **kw}) + "\n")
+
+    async def send(self, job, msg):
+        try:
+            job.writer.write((json.dumps(msg) + "\n").encode())
+            await job.writer.drain()
+        except Exception:
+            pass
+
+    def cpu_used(self):
+        return sum(j.cpus for j in self.jobs.values() if j.state in ("granted", "running"))
+
+    def mem_held(self):
+        return sum(j.mem for j in self.jobs.values() if j.state in ("granted", "running", "frozen"))
+
+    def fits(self, job):
+        return (self.cpu_used() + job.cpus <= CPU_CAP
+                and mem_available() - job.mem >= MEM_RESERVE)
+
+    async def tick(self):
+        now = time.time()
+        for j in self.jobs.values():  # overrun: a "short" job that runs long is long
+            if j.state == "running" and not j.long and now - j.started > j.est * 1.5 + 120:
+                j.long = True
+                await self.send(j, {"op": "note", "msg": f"ran past its {human(j.est)} estimate; now in the long lane"})
+                self.log(j, "demoted")
+        queued = sorted((j for j in self.jobs.values() if j.state == "queued"),
+                        key=lambda j: (not j.short_now(), j.submitted))
+        short_waiting = [j for j in queued if j.short_now()]
+        # Thaw frozen jobs first when no short job is waiting, or when they fit anyway.
+        for j in sorted((j for j in self.jobs.values() if j.state == "frozen"), key=lambda j: j.started):
+            over_budget = j.frozen_total + now - j.frozen_since > FREEZE_BUDGET
+            if over_budget or (self.cpu_used() + j.cpus <= CPU_CAP and not short_waiting):
+                await self.thaw(j)
+        # Grant in order; later jobs may backfill unless the head has waited 10m.
+        for i, j in enumerate(queued):
+            if self.fits(j):
+                j.state = "granted"
+                await self.send(j, {"op": "grant", "unit": j.unit})
+                self.log(j, "granted")
+            elif i == 0 and now - j.submitted > 600:
+                break
+        # Sideline: free CPU for a short job stuck behind long work.
+        stuck = [j for j in queued if j.state == "queued" and j.short_now()
+                 and now - j.submitted > FREEZE_AFTER and mem_available() - j.mem >= MEM_RESERVE]
+        if stuck:
+            need = stuck[0].cpus - (CPU_CAP - self.cpu_used())
+            victims = sorted((v for v in self.jobs.values() if v.state == "running" and v.long
+                              and v.frozen_total < FREEZE_BUDGET), key=lambda v: -v.started)
+            for v in victims:
+                if need <= 0:
+                    break
+                if await self.freeze(v, f"short job #{stuck[0].id} needs CPU"):
+                    need -= v.cpus
+
+    async def freeze(self, j, why):
+        if not user_systemctl("freeze", j.unit + ".scope"):
+            return False
+        j.state, j.frozen_since = "frozen", time.time()
+        await self.send(j, {"op": "note", "msg": f"frozen: {why}"})
+        self.log(j, "frozen", why=why)
+        return True
+
+    async def thaw(self, j):
+        user_systemctl("thaw", j.unit + ".scope")
+        j.frozen_total += time.time() - j.frozen_since
+        j.state, j.frozen_since = "running", None
+        await self.send(j, {"op": "note", "msg": f"thawed after {human(j.frozen_total)} frozen in total"})
+        self.log(j, "thawed")
+
+    async def client(self, reader, writer):
+        job = None
+        try:
+            async for raw in reader:
+                msg = json.loads(raw)
+                if msg["op"] == "ls":
+                    writer.write((json.dumps([j.view() for j in self.jobs.values()]) + "\n").encode())
+                    await writer.drain()
+                    break
+                if msg["op"] == "submit":
+                    job = Job(self.next_id, msg, writer)
+                    self.next_id += 1
+                    self.jobs[job.id] = job
+                    ahead = sum(1 for j in self.jobs.values() if j.state == "queued" and j is not job)
+                    await self.send(job, {"op": "queued", "id": job.id, "ahead": ahead,
+                                          "lane": "long" if job.long else "short"})
+                    self.log(job, "submitted")
+                    await self.tick()
+                elif msg["op"] == "started" and job:
+                    job.state, job.started = "running", time.time()
+                    self.log(job, "started")
+                elif msg["op"] == "done" and job:
+                    job.state = "done"
+                    self.log(job, "done", code=msg.get("code"))
+                    break
+        except (ConnectionError, json.JSONDecodeError, KeyError):
+            pass
+        finally:
+            if job:
+                if job.frozen_since:   # never leave a frozen orphan, even if CMD itself exited
+                    user_systemctl("thaw", job.unit + ".scope")
+                if job.state != "queued":   # also ends processes CMD left behind
+                    user_systemctl("stop", "--no-block", job.unit + ".scope")
+                if job.state in ("granted", "running", "frozen"):
+                    self.log(job, "abandoned")
+                self.jobs.pop(job.id, None)
+                await self.tick()
+            writer.close()
+
+    async def loop(self):
+        while True:
+            await asyncio.sleep(TICK)
+            await self.tick()
+
+
+async def daemon():
+    bus = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "bus")
+    if not os.path.exists(bus):
+        sys.exit(f"dibsd: no user D-Bus at {bus}; install dbus-user-session and log in again (dibs needs it to freeze and stop jobs)")
+    if os.path.exists(SOCK):
+        os.unlink(SOCK)
+    s = Sched()
+    server = await asyncio.start_unix_server(s.client, SOCK)
+    os.chmod(SOCK, 0o600)
+    async with server:
+        await asyncio.gather(server.serve_forever(), s.loop())
+
+
+# ---- client ------------------------------------------------------------------
+
+def say(msg):
+    print(f"[dibs] {msg}", file=sys.stderr, flush=True)
+
+
+async def run(a):
+    cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    if not cmd:
+        sys.exit("dibs run: nothing to run")
+    if len(cmd) == 1 and " " in cmd[0]:
+        cmd = ["bash", "-c", cmd[0]]
+    try:
+        reader, writer = await asyncio.open_unix_connection(SOCK)
+    except OSError:
+        sys.exit("dibs: scheduler not running (systemctl --user start dibsd)")
+    req = {"op": "submit", "cmd": " ".join(cmd), "cwd": os.getcwd(), "cpus": a.cpus, "mem": a.mem,
+           "est": a.est, "long": a.long, "label": a.label or os.path.basename(cmd[0])}
+    writer.write((json.dumps(req) + "\n").encode())
+    await writer.drain()
+    t0, proc, unit = time.time(), None, None
+
+    async def inbox():
+        nonlocal proc, unit
+        async for raw in reader:
+            msg = json.loads(raw)
+            if msg["op"] == "queued":
+                say(f"ticket #{msg['id']} ({msg['lane']} lane), {msg['ahead']} ahead")
+            elif msg["op"] == "grant":
+                unit = msg["unit"]
+                say(f"licensed after {human(time.time() - t0)}: {req['cpus']} cpus, {a.mem_s} mem")
+                proc = await asyncio.create_subprocess_exec(
+                    "systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}",
+                    f"-pCPUQuota={a.cpus * 100}%", f"-pMemoryHigh={a.mem}", f"-pMemoryMax={int(a.mem * 1.5)}",
+                    "--", *cmd)
+                writer.write(b'{"op":"started"}\n')
+                await writer.drain()
+                return
+            elif msg["op"] == "note":
+                say(msg["msg"])
+
+    def stop(*_):
+        if proc and proc.returncode is None:
+            proc.terminate()
+        else:
+            os._exit(130)
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        loop.add_signal_handler(sig, stop)
+    await inbox()
+    if proc is None:
+        sys.exit("dibs: scheduler went away before granting")
+    notes = asyncio.create_task(drain_notes(reader))
+    code = await proc.wait()
+    notes.cancel()
+    writer.write((json.dumps({"op": "done", "code": code}) + "\n").encode())
+    await writer.drain()
+    writer.close()
+    say(f"exit {code} after {human(time.time() - t0)} total")
+    sys.exit(code if code >= 0 else 128 - code)
+
+
+async def drain_notes(reader):
+    async for raw in reader:
+        msg = json.loads(raw)
+        if msg.get("op") == "note":
+            say(msg["msg"])
+
+
+async def ls():
+    try:
+        reader, writer = await asyncio.open_unix_connection(SOCK)
+    except OSError:
+        sys.exit("dibs: scheduler not running")
+    writer.write(b'{"op":"ls"}\n')
+    await writer.drain()
+    jobs = json.loads(await reader.readline())
+    if not jobs:
+        print("idle")
+    for j in sorted(jobs, key=lambda j: j["id"]):
+        print(f"#{j['id']:<4} {j['state']:<8} {j['lane']:<5} {j['cpus']:>2}c {j['mem'] >> 30:>3}G "
+              f"est {human(j['est']):>7}  waited {human(j['waited']):>7}  ran {human(j['ran']):>7}  "
+              f"{j['label']}  ({j['cwd']})")
+
+
+def main():
+    load_config()
+    p = argparse.ArgumentParser(prog="dibs", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="op", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("--est", type=parse_dur, default=600, help="expected runtime, e.g. 90s, 10m, 2h (default 10m)")
+    cpus = min(4, CPU_CAP)
+    r.add_argument("--cpus", type=int, default=cpus, choices=range(1, CPU_CAP + 1), metavar=f"1-{CPU_CAP}",
+                   help=f"CPU threads to reserve, at most {CPU_CAP} (default {cpus})")
+    r.add_argument("--mem", default="4G", help="RAM to reserve, e.g. 8G (default 4G)")
+    r.add_argument("--long", action="store_true", help="put in the long lane regardless of --est")
+    r.add_argument("--label")
+    r.add_argument("cmd", nargs=argparse.REMAINDER)
+    sub.add_parser("ls")
+    sub.add_parser("daemon")
+    a = p.parse_args()
+    if a.op == "run":
+        a.mem_s, a.mem = a.mem, parse_mem(a.mem)
+        asyncio.run(run(a))
+    elif a.op == "ls":
+        asyncio.run(ls())
+    else:
+        asyncio.run(daemon())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+[Unit]
+Description=dibs job queue for this machine
+
+[Service]
+ExecStart=%h/.local/bin/dibs daemon
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

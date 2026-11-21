@@ -1,0 +1,21 @@
+# Copy to ~/.config/dibs/config.toml and uncomment what you want to change.
+# Restart the daemon afterwards: systemctl --user restart dibsd
+# Sizes and durations are quoted strings: "512M", "8G", "90s", "15m", "2h".
+
+# CPU threads all running jobs may request together. Default: thread count minus 2.
+# cpu_cap = 14
+
+# Never grant a job if MemAvailable minus its request would fall below this. Default: 10% of RAM.
+# mem_reserve = "6G"
+
+# Jobs with --est at or below this are in the short lane.
+# short_max = "15m"
+
+# A long job that has waited this long is scheduled as short.
+# age_promote = "30m"
+
+# How long a short job waits for CPU before a running long job is frozen.
+# freeze_after = "20s"
+
+# A job is never frozen for longer than this in total.
+# freeze_budget = "60m"
